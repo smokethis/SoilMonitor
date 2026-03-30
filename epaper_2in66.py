@@ -7,6 +7,22 @@ Interface: SPI
 Based closely on Waveshare's official Python driver (epd2in66.py),
 adapted for MicroPython on the Raspberry Pi Pico 2 W.
 
+Tri-color support:
+  The display hardware has two RAM planes:
+    0x24 — Black/White RAM: 0 = black pixel, 1 = white pixel
+    0x26 — Red RAM:         1 = red pixel,   0 = no red
+
+  Red always wins. If a pixel is set in both the B/W and red
+  planes, it appears red on screen. That's why when drawing a
+  red pixel we set it to white (1) in the B/W plane — the red
+  layer overrides it anyway, and this avoids dark edges from
+  the B/W plane bleeding through.
+
+  Full refresh with red takes ~15 seconds (the controller runs
+  through multiple voltage cycles to push the red pigment
+  particles into place). B/W-only refreshes are faster (~2s)
+  but still write and clear the red RAM to avoid ghost images.
+
 Key differences from Waveshare's CPython driver:
   - Uses machine.SPI and machine.Pin instead of RPi.GPIO/spidev
   - Includes a local pixel buffer and drawing primitives since
@@ -39,6 +55,7 @@ class EPD_2in66:
 
         self._buffer_size = (self.width * self.height) // 8
         self.buffer_black = bytearray(self._buffer_size)
+        self.buffer_red = bytearray(self._buffer_size)
 
     def _send_command(self, cmd):
         """Send a command byte (DC=LOW)."""
@@ -169,38 +186,57 @@ class EPD_2in66:
 
         self._turn_on_display()
 
-    def display(self, buf_black=None):
+    def display(self, buf_black=None, buf_red=None):
         """
-        Write the B/W image buffer to the display and refresh.
+        Write image buffers to the display and refresh.
 
-        Only writes to 0x24 (B/W RAM). Does NOT touch 0x26 (red RAM)
-        — after clear() has zeroed it out, it stays clean.
+        Sends both the B/W plane (0x24) and the red plane (0x26).
+        The controller's RAM address counter auto-increments as data
+        is written; sending a new RAM write command (0x24 or 0x26)
+        resets the counter to the start of that plane — so we only
+        need to call _set_cursor() once at the top.
+
+        If buf_red is not provided, the internal buffer_red is used.
+        After clear() this is all zeros (no red), so existing B/W-only
+        code that never touches buffer_red still works correctly.
         """
         self._set_cursor()
 
         self._send_command(0x24)
-        if buf_black:
-            self._send_data_bulk(buf_black)
-        else:
-            self._send_data_bulk(self.buffer_black)
+        self._send_data_bulk(buf_black if buf_black else self.buffer_black)
+
+        self._send_command(0x26)
+        self._send_data_bulk(buf_red if buf_red else self.buffer_red)
 
         self._turn_on_display()
 
     # ── Drawing primitives ──────────────────────────────
 
     def fill_black(self, value=0xFF):
-        """Fill the local buffer. 0xFF=white, 0x00=black."""
+        """Fill the B/W buffer. 0xFF = all white, 0x00 = all black."""
         for i in range(len(self.buffer_black)):
             self.buffer_black[i] = value
 
+    def fill_red(self, value=0x00):
+        """Fill the red buffer. 0x00 = no red, 0xFF = all red."""
+        for i in range(len(self.buffer_red)):
+            self.buffer_red[i] = value
+
     def pixel(self, x, y, color='black'):
         """
-        Set a single pixel in the local buffer.
+        Set a single pixel in the local buffers.
+
+        The two RAM planes interact like layers in an image editor:
+        the red plane sits on top. If a pixel is marked red, the
+        B/W value underneath doesn't matter — it shows red. So when
+        drawing red, we also set the B/W plane to white (1) for
+        cleanliness, and when drawing black or white we clear the
+        red plane to make sure no stale red data shows through.
 
         Args:
             x: Column (0 to 151)
             y: Row (0 to 295)
-            color: 'black' or 'white'
+            color: 'black', 'white', or 'red'
         """
         if x < 0 or x >= self.width or y < 0 or y >= self.height:
             return
@@ -209,9 +245,14 @@ class EPD_2in66:
         bit_mask = 0x80 >> (x % 8)
 
         if color == 'black':
-            self.buffer_black[byte_index] &= ~bit_mask
+            self.buffer_black[byte_index] &= ~bit_mask   # 0 in B/W = black
+            self.buffer_red[byte_index] &= ~bit_mask      # clear red layer
         elif color == 'white':
-            self.buffer_black[byte_index] |= bit_mask
+            self.buffer_black[byte_index] |= bit_mask     # 1 in B/W = white
+            self.buffer_red[byte_index] &= ~bit_mask      # clear red layer
+        elif color == 'red':
+            self.buffer_black[byte_index] |= bit_mask     # white underneath
+            self.buffer_red[byte_index] |= bit_mask       # 1 in red = red
 
     def hline(self, x, y, width, color='black'):
         """Draw a horizontal line."""
@@ -247,7 +288,7 @@ class EPD_2in66:
             string: Text to draw
             x: Left edge pixel position
             y: Top edge pixel position
-            color: 'black' or 'white'
+            color: 'black', 'white', or 'red'
             scale: Integer multiplier (1 = 5×8, 2 = 10×16, etc.)
         """
         cursor_x = x
